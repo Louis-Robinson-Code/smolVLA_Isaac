@@ -135,7 +135,7 @@ class Joy_Sub(Node):
         self.time_now=self.get_clock().now() #getting current time
 
         #if the xbox button has been pressed to start/stop teleop
-        if ((self.time_now-self.time_at_flip).nanoseconds * 1e-9 > 0.3) and self.controller.buttons[8] is 1:
+        if ((self.time_now-self.time_at_flip).nanoseconds * 1e-9 > 0.3) and self.controller.buttons[8] is 1:    #small delay used to ignore multiple input presses due to high Hz
             self.teleop_state = not self.teleop_state
             self.time_at_flip = self.time_now
             print(f"Teleoperation : ", self.teleop_state)
