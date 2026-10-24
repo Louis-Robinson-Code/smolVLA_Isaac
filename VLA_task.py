@@ -1,8 +1,16 @@
 
 
+import os
+
 from isaacsim import SimulationApp
 simulation_app = SimulationApp({"headless": False}) # set true for headless (reduced GPU consumption)
 
+# enabling the ros2 bridge extension for ros2_control.py
+from isaacsim.core.utils.extensions import enable_extension
+enable_extension("isaacsim.ros2.bridge")
+enable_extension("omni.graph.window.action")
+enable_extension("omni.graph.window.generic")
+simulation_app.update()
 
 #--- omni library -----
 import omni.usd # Imports the USD
@@ -23,6 +31,7 @@ import time, random, asyncio, datetime
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
+
 
 
 
@@ -111,6 +120,9 @@ class Task(BaseTask):
         return
 
     #Task metadata for monitoring progress
+    '''
+    Replaced with ROS2 bridge
+    '''
     def get_observations(self): 
         cube_pos, cube_orientation = self.cube.get_world_pose()
         joint_pos = self.arm.get_joint_positions()
@@ -128,6 +140,8 @@ class Task(BaseTask):
              }
         }
         return observations
+    #--------------------
+
 
     #called before each physics step
     def pre_step(self, control_index, simulation_time):
@@ -158,7 +172,7 @@ class VLAEnvironment():
         self.arm = self.world.scene.get_object("so_arm100")
         self.arm.initialize() # initialises the controller
 
-        self.world.add_physics_callback("sim_step", callback_fn=self.physics_step)
+        #self.world.add_physics_callback("sim_step", callback_fn=self.physics_step)
         return
 
 
@@ -185,12 +199,12 @@ class VLAEnvironment():
         self.camera_wrist = Camera(
             prim_path="/so_arm100/gripper/Top",
             frequency=30,
-            resolution=(640,480)
+            resolution=(256,256)    #ensure the same value is allocated to ros2 Isaac Create Render Product Node!
         )
         self.camera_scene = Camera(
             prim_path="/so_arm100/scene",
             frequency=30,
-            resolution=(640,480)
+            resolution=(256,256)
         )
 
         # --- initialising both cameras -----
@@ -231,7 +245,7 @@ def capture_scene(image):
         print(f"Camera snapshot failed")
     return
 
-
+'''
 def debug_output():
     kps, kds = simulation.arm.get_articulation_controller().get_gains()
     print("kp:", kps, "kd:", kds)
@@ -240,19 +254,20 @@ def debug_output():
 
 
     return
-
+'''
 
 # ------- Main program ---------
 
 # Open the saved environment instead of building one from scratch
 omni.usd.get_context().open_stage("/home/louis/finalYear/SO-ARM100_sim_test.usd")
 
-from smolvla_client import SmolVLARunner   # you can also move this to the top with your other imports
+#from smolvla_client import SmolVLARunner   # you can also move this to the top with your other imports
 
 simulation = VLAEnvironment()
 simulation.establish_viewports()
 
-runner = SmolVLARunner(instruction="pick up the red cube",lower=simulation.arm.dof_properties["lower"],upper=simulation.arm.dof_properties["upper"])   # once only
+
+#runner = SmolVLARunner(instruction="pick up the red cube",lower=simulation.arm.dof_properties["lower"],upper=simulation.arm.dof_properties["upper"])   # once only
 policy_step = 2      # physics 60 Hz -> policy ~30 Hz. 
 
 print(simulation.arm.dof_names)
@@ -261,32 +276,35 @@ print(simulation.arm.dof_properties["lower"], simulation.arm.dof_properties["upp
 i = 0
 while simulation_app.is_running():
     simulation.world.step(render=True)
-  
-
+    
+    '''
     if i >= 30 and i % policy_step == 0:
 
         #----- Grabbing images for debug------#
         wrist_image = simulation.camera_wrist.get_rgba()
-        #capture_scene(wrist_image)
+        capture_scene(wrist_image)
         scene_image = simulation.camera_scene.get_rgba()
         #capture_scene(scene_image)
 
 
         if wrist_image is not None and scene_image is not None and wrist_image.size and scene_image.size:
             
+            
             target = runner.act(
                 joint_pos_rad=simulation.arm.get_joint_positions(),
                 wrist_rgb=wrist_image[:, :, :3],
                 scene_rgb=scene_image[:, :, :3],
             )
-
+            
             #debug_output()
             simulation.arm.apply_action(ArticulationAction(joint_positions=target))
+            
+    '''
     
     if simulation.task.task_achieved:
         print("Task Achieved")
         simulation.world.reset()   # triggers Task.post_reset
-        runner.reset()
+        #runner.reset()
         i = 0
 
     i += 1

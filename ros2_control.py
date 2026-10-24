@@ -14,10 +14,24 @@ from geometry_msgs.msg import Twist
 
 #from smolvla import smolVLA
 
+
+
+
+
+#---Setting joint limits----#
+upper_lim=[2,3,0,0.95,1.2,3.14159,2]
+lower_lim=[-2,0,-3.1415752,-2.15,-3.1415752,-0.199997279]
+
+
+
+
 '''
 ROS2 Bridge to Connect Isaac sim S0-100 arm joint state to SmolVLA
 1. --Use start_ros2.py to load up isaac sim with the ros2 bridge--
-2. -- Run with : /usr/bin/python3 /home/louis/nvidia/FinalYearProject/ros2_control.py --
+2. -- Run with : 
+    source /opt/ros/jazzy/setup.bash
+    /usr/bin/python3 /home/louis/nvidia/FinalYearProject/ros2_control.py
+
 
 References:
 ROS 2 install:  https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html
@@ -81,9 +95,7 @@ class Joy_Sub(Node):
         dt = (current_time - self.last_time).nanoseconds * 1e-9
         self.last_time = current_time
 
-        #---Setting joint limits----#
-        upper_lim=[2,3,0,0.95,1.2,3.14159,2]
-        lower_lim=[-2,0,-3.1415752,-2.15,-3.1415752,-0.199997279]
+        
 
         #---fetching controller input----#
         input=np.array([self.controller.axes[0],self.controller.axes[1],-self.controller.axes[4],self.controller.axes[2]-self.controller.axes[5],self.controller.buttons[4]-self.controller.buttons[5],self.controller.buttons[1]-self.controller.buttons[2]])
@@ -149,7 +161,7 @@ class Joy_Sub(Node):
 
 class Wrist_Camera_Subscriber(Node):
     def __init__(self,stream):
-        super().__init__('camera_listener')
+        super().__init__('wrist_camera_listener')
         self.stream=stream      #sharing the stream class instance
         self.latest_frame = None
         self.create_subscription(
@@ -167,23 +179,28 @@ class Wrist_Camera_Subscriber(Node):
 
 
 class Publisher(Node):
-    def __init__(self):
+    def __init__(self, hz=30):
         super().__init__('joint_publisher')
         self.pub = self.create_publisher(JointState,'joint_command',10)
-        self.pos = [0.0,2.0,1.3,-1.3,0.3,1.0]
-        timer_period=0.5 #seconds
-        self.timer= self.create_timer(timer_period, self.timer_callback)
+        self.pos = None
+        #timer_period=0.5 #seconds
+        #self.timer= self.create_timer(timer_period, self.timer_callback)
         
+        self.create_timer(1.0 / hz, self.publish_action)
         return
 
 
-    def timer_callback(self):
+    def publish_action(self):
         msg=JointState()
         msg.name = ["shoulder_pan", "shoulder_lift","elbow_flex","wrist_flex","wrist_roll","gripper"]
-        msg.position = self.pos # in radians
-        self.pub.publish(msg)
+        if self.pos is not None:
+            #--- Enforcing joint limits ----#
+            for i, radians in enumerate(self.pos):
+                self.pos[i]=np.clip(self.pos[i],lower_lim[i],upper_lim[i])
 
-        self.get_logger().info('Publishing: "%s"' %msg.position)
+            msg.position = self.pos # in radians
+            self.pub.publish(msg)
+            print(f"Publishing: {msg.position}")
         return
 
 
@@ -203,6 +220,7 @@ class Subscriber(Node):
 
     def listener_callback(self, msg):
         self.joint_pos=msg.position
+        #joint_pos_to_degree = [np.rad2deg(x) for x in self.joint_pos]  #converting to degrees for smolVLA
         self.stream.state_array=self.joint_pos  #setting the updated joint pos to TCP streamers input
         #self.get_logger().info('I heard: "%s"' % msg.position)
         return
@@ -215,9 +233,10 @@ Ros2 and lerobot are incompatible and therefore must be ran under different envi
 the need for TCP.
 '''
 class Streamer(Node):
-    def __init__(self, hz=5):
+    def __init__(self,publisher, hz=30, ):
 
         super().__init__('ROS_TCP')
+        self.publisher=publisher
         self.state_array=None
         self.image_array=None
         self.prompt=None
@@ -230,7 +249,7 @@ class Streamer(Node):
         self.socket.connect(("127.0.0.1", 5301))
         print(f"ROS2 TCP Streamer Initialised")
 
-        self.create_timer(1.0 / hz, self.send_obs)
+        self.create_timer(1.0 / hz, self.send_obs)  #ros2 timer to send the latest observation to smolVLA at a fixed frequency (hz)
         #stream_main = threading.Thread(target=self.main, daemon=True)
         #stream_main.start()
     
@@ -241,8 +260,12 @@ class Streamer(Node):
         #if self.state_array != self.prev_state_array or self.image_array != self.prev_image_array:
         send_msg(self.socket, {"state": self.state_array, "image": self.image_array, "task": self.prompt})
         action = recv_msg(self.socket)
-        print(f"Received: {action}")
-
+        if action is not None:  #action is received from smolVLA and is a tensor of joint angles in degrees, which needs to be converted to radians for ROS2 publishing
+            tensor_to_degree_action = np.asarray(action, dtype=np.float64).reshape(-1).tolist()  #tensor to list for publishing
+            degree_to_radian_action = [np.deg2rad(x) for x in tensor_to_degree_action]  #converting to radians for ROS2 publishing
+            self.publisher.pos = degree_to_radian_action    #publishing to joint publisher node to send to isaac sim
+            print(f"Publishing: {self.publisher.pos}")
+    
         return
 
     '''
@@ -269,12 +292,12 @@ def main(args=None):
     joy_node = subprocess.Popen(['ros2','run','joy', 'joy_node'])
 
     rclpy.init(args=args)
-    
-    stream = Streamer()
+    publisher = Publisher()
+    stream = Streamer(publisher)  #initialising the TCP streamer with the publisher to send joint commands to
     stream.prompt=task_prompt   #setting the TCP streams task prompt
 
     subscriber = Subscriber(stream)
-    #publisher = Publisher()
+    
     wrist_image_subscriber = Wrist_Camera_Subscriber(stream)
     teleop = Joy_Sub()
     
@@ -283,7 +306,7 @@ def main(args=None):
 
     executor = MultiThreadedExecutor()
     executor.add_node(subscriber)
-    #executor.add_node(publisher)
+    executor.add_node(publisher)
     executor.add_node(wrist_image_subscriber)
     executor.add_node(teleop)
     executor.add_node(stream)
@@ -299,7 +322,7 @@ def main(args=None):
         joy_node.terminate() # Cleaning up the joy_node process
         subscriber.destroy_node()
         #VLA.destroy_node()
-        #publisher.destroy_node()
+        publisher.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
 
