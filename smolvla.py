@@ -12,16 +12,19 @@ import threading
 
 from tcp_helper import send_msg, recv_msg
 
-
-
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 from lerobot.policies.factory import make_pre_post_processors  # path may differ by LeRobot version
 
 
 '''
-Listening for SMolVLA input over TCP, and sending back the action output.
+VLA_task.py is the main script that runs the nvidia isaac standalone application, creating unique environments for each run.
+ros2_control.py sends the camera image, joint state (in degrees), and task string to this script over TCP.
+smolVLA receives the input, runs inference, and sends back the action output over TCP to ros2_control.py as a tensor of joint angles in degrees.
+ros2_control.py then converts this to radians and sends the action to the robot over ROS2.
 '''
 
+
+'''Listening for SMolVLA input over TCP, and sending back the action output.'''
 class Streamer():
 
     def __init__(self,smolvla):
@@ -74,7 +77,7 @@ class Streamer():
 
 
 
-
+'''VLA policy that loads smolVLA, receives image, joint state, and task, normalizes them, runs inference, and denormalizes the output action.'''
 class smolVLA():
 
     def __init__(self):
@@ -134,12 +137,6 @@ class smolVLA():
         return torch.from_numpy(rgb_uint8.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0)
 
 
-    # Placeholder frames; replace with real images (any size, the policy resizes internally)
-    #frame = np.full((480, 640, 3), 128, dtype=np.uint8)
-
-    
-
-
 
 if __name__ == "__main__":
     smolvla = smolVLA()
@@ -148,6 +145,7 @@ if __name__ == "__main__":
     #starting the streamer and smolvla in separate threads so they can run in parallel
     streamer_thread = threading.Thread(target=streamer.main)
     streamer_thread.start()
+    
     #smolvla_thread = threading.Thread(target=smolvla.main)
     #smolvla_thread.start()
     

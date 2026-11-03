@@ -107,7 +107,7 @@ class Task(BaseTask):
                 scale=np.array([rand_size, rand_size, rand_size]),
                 color=np.array([rand_Rcolour, rand_Gcolour, rand_Bcolour]),
             )
-        ) 
+        )
         
     #setting up the tasks scene
     def set_up_scene(self, scene):
@@ -259,7 +259,7 @@ def debug_output():
 # ------- Main program ---------
 
 # Open the saved environment instead of building one from scratch
-omni.usd.get_context().open_stage("/home/louis/finalYear/SO-ARM100_sim_test.usd")
+omni.usd.get_context().open_stage("/home/louis/finalYear/SO-100_environments.usd")
 
 #from smolvla_client import SmolVLARunner   # you can also move this to the top with your other imports
 

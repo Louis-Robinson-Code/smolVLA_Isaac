@@ -1,0 +1,66 @@
+import numpy as np
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+
+class RecordDataset():
+    def __init__(self):
+        self.joints = ["shoulder_pan", "shoulder_lift","elbow_flex","wrist_flex","wrist_roll","gripper"]    #joint names for the robot, used to name the state and action features in the dataset
+
+        #   collect all cameras in the dataset, then pick and choose the tensors for each camera for a later evaluation of performance.
+        self.features = {       #the features the dataset will store (images, state, action)
+            "observation.images.camera1": {"dtype": "video", "shape": (256, 256, 3), "names": ["height","width","channels"]},
+            "observation.images.camera2": {"dtype": "video", "shape": (256, 256, 3), "names": ["height","width","channels"]},
+            "observation.images.camera3": {"dtype": "video", "shape": (256, 256, 3), "names": ["height","width","channels"]},
+            "observation.state": {"dtype": "float32", "shape": (6,), "names": self.joints},
+            "action":            {"dtype": "float32", "shape": (6,), "names": self.joints},
+        }
+
+        self.dataset = LeRobotDataset(
+            features=self.features,             #the features the dataset will store (images, state, action)
+            fps=30,                             #the framerate of the video to be recorded
+            repo_id="LRA1/smolvla_red_cube",    #the HuggingFace repo where the dataset will be stored
+            robot_type="so100",                 #the robot type (more for metadata than anything else in our sim application)
+            use_video=True,                     #whether to store the images as a video or as individual frames
+        )
+
+        self.task=None      #temp until assigned during task
+        self.state=None     #temp until assigned during task
+        self.action=None    #temp until assigned during task
+
+        return
+
+    def add_data(self,frame,state,action,task):
+        '''Should only be called at the correct fps to avoid duplicate/missing frames in the dataset.'''
+        self.task=task
+        self.state=state
+        self.action=action
+        self.dataset.add_data(
+            {
+                "observation.images.camera2": frame,  # the image from the camera
+                "observation.state": state,            # the joint state
+                "action": action,                      # the action taken
+            }
+        )
+        return
+
+
+    def clear_episode(self):
+        self.dataset.clear_episode()
+        return
+
+    def save_episode(self):
+        self.dataset.save_episode()
+        return
+
+    def save_dataset(self):
+        self.dataset.save()
+        return
+
+        
+
+        
+
+
+if __name__ == "__main__":
+    record_dataset = RecordDataset()
+    

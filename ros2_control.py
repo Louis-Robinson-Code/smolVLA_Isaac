@@ -19,8 +19,9 @@ from geometry_msgs.msg import Twist
 
 
 #---Setting joint limits----#
-upper_lim=[2,3,0,0.95,1.2,3.14159,2]
-lower_lim=[-2,0,-3.1415752,-2.15,-3.1415752,-0.199997279]
+upper_lim=[2,3.49,0,1.2,3.14159,2]
+lower_lim=[-2,0,-3.1415752,-2.5,-3.1415752,-0.199997279]
+joint_names = ["shoulder_pan", "shoulder_lift","elbow_flex","wrist_flex","wrist_roll","gripper"]
 
 
 
@@ -62,10 +63,16 @@ class Joy_Sub(Node):
     Listening for controller inputs and starting/stopping teleop control state
     '''
 
-    def __init__(self):
+    def __init__(self, executor, publisher, subscriber, wrist_image_subscriber, stream):
         super().__init__('controller_listener')
-
-        self.teleop_state=False #flag for teleoperation state
+        self.executor=executor
+        self.subscriber=subscriber
+        self.wrist_image_subscriber=wrist_image_subscriber
+        self.stream=stream
+        self.publisher=publisher
+        
+        
+        self.teleop_state=True #flag for teleoperation state
         self.time_at_flip=self.get_clock().now() # time when teleop state changes
 
         self.current_joints=self.create_subscription(JointState,'joint_states',self.joints_callback,20) #listening for current joint positions (feedback control later?)
@@ -74,7 +81,7 @@ class Joy_Sub(Node):
         
         self.controller = Joy()
         self.teleop_control = JointState()
-        self.teleop_control.name = ["shoulder_pan", "shoulder_lift","elbow_flex","wrist_flex","wrist_roll","gripper"]
+        self.teleop_control.name = joint_names
         self.target_pos=np.array([0.0,0.0,0.0,0.0,-1.5708,0.0])
         self.max_speed=0.5
         self.last_time= self.get_clock().now()
@@ -84,6 +91,18 @@ class Joy_Sub(Node):
     def joints_callback(self,msg):  
         #   nothing for now
         return
+
+
+    '''Change to IK'''
+
+    '''
+    - Take x,y,z,rx,ry,rz from the controller. 
+    - convert to joint space using IK (isaac lab has a built in IK solver).
+
+    
+    Use isaac lab 
+    
+    '''
 
     def start_teleop_control(self):
 
@@ -95,7 +114,6 @@ class Joy_Sub(Node):
         dt = (current_time - self.last_time).nanoseconds * 1e-9
         self.last_time = current_time
 
-        
 
         #---fetching controller input----#
         input=np.array([self.controller.axes[0],self.controller.axes[1],-self.controller.axes[4],self.controller.axes[2]-self.controller.axes[5],self.controller.buttons[4]-self.controller.buttons[5],self.controller.buttons[1]-self.controller.buttons[2]])
@@ -155,6 +173,15 @@ class Joy_Sub(Node):
         #if xbox button pressed to start teleop, start formulating joint commands from the controller.
         if self.teleop_state is True:
             self.start_teleop_control()
+            self.executor.remove_node(self.subscriber)
+            self.executor.remove_node(self.wrist_image_subscriber)
+            self.executor.remove_node(self.stream)
+            self.executor.remove_node(self.publisher)
+        else:
+            self.executor.add_node(self.subscriber)
+            self.executor.add_node(self.wrist_image_subscriber)
+            self.executor.add_node(self.stream)
+            self.executor.add_node(self.publisher)
 
         return
 
@@ -192,12 +219,15 @@ class Publisher(Node):
 
     def publish_action(self):
         msg=JointState()
-        msg.name = ["shoulder_pan", "shoulder_lift","elbow_flex","wrist_flex","wrist_roll","gripper"]
+        msg.name = joint_names
         if self.pos is not None:
             #--- Enforcing joint limits ----#
             for i, radians in enumerate(self.pos):
+                if i ==2 or i==3:  #inverting the elbow and wrist flex joints to match the robot's joint direction
+                    self.pos[i] = self.pos[i] * -1
                 self.pos[i]=np.clip(self.pos[i],lower_lim[i],upper_lim[i])
 
+            
             msg.position = self.pos # in radians
             self.pub.publish(msg)
             print(f"Publishing: {msg.position}")
@@ -220,8 +250,8 @@ class Subscriber(Node):
 
     def listener_callback(self, msg):
         self.joint_pos=msg.position
-        #joint_pos_to_degree = [np.rad2deg(x) for x in self.joint_pos]  #converting to degrees for smolVLA
-        self.stream.state_array=self.joint_pos  #setting the updated joint pos to TCP streamers input
+        joint_pos_to_degree = [np.rad2deg(x) for x in self.joint_pos]  #converting to degrees for smolVLA
+        self.stream.state_array=joint_pos_to_degree  #setting the updated joint pos to TCP streamers input
         #self.get_logger().info('I heard: "%s"' % msg.position)
         return
 
@@ -292,25 +322,34 @@ def main(args=None):
     joy_node = subprocess.Popen(['ros2','run','joy', 'joy_node'])
 
     rclpy.init(args=args)
+    executor = MultiThreadedExecutor()
+
+    
     publisher = Publisher()
+
+    '''VLA relevant nodes'''
     stream = Streamer(publisher)  #initialising the TCP streamer with the publisher to send joint commands to
     stream.prompt=task_prompt   #setting the TCP streams task prompt
-
     subscriber = Subscriber(stream)
-    
     wrist_image_subscriber = Wrist_Camera_Subscriber(stream)
-    teleop = Joy_Sub()
+
+    '''teleop control node for the robot'''
+    teleop = Joy_Sub(executor,publisher,subscriber,wrist_image_subscriber,stream)  #initialising the teleop control node
+    
+    
     
 
     #VLA = smolVLA()
 
-    executor = MultiThreadedExecutor()
-    executor.add_node(subscriber)
-    executor.add_node(publisher)
-    executor.add_node(wrist_image_subscriber)
+    
     executor.add_node(teleop)
-    executor.add_node(stream)
-    #executor.add_node(VLA)
+    executor.add_node(publisher)
+    
+    
+
+    
+    
+        
 
     try:
         executor.spin()
