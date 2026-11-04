@@ -6,15 +6,21 @@ import socket
 from tcp_helper import send_msg, recv_msg
 
 
+
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.node import Node
 from sensor_msgs.msg import JointState, Image, Joy
-from geometry_msgs.msg import Twist
+
+
+
 
 #from smolvla import smolVLA
 
-
+'''
+TO DO
+ARM is spasming when teleop is activated. Need to find out why. I think its because the IK fails and something happens when the requested pos it out of bounds
+'''
 
 
 
@@ -47,15 +53,7 @@ Pub/Sub commands to interact with Isaac: https://docs.ros.org/en/jazzy/Tutorials
 Ros2 Joy : https://index.ros.org/p/joy/
 '''
 
-# Need to find a way to convert the image into a format for smolVLA / Lerobot.
-# import the policy, dont need to define a port as thats for hardware.
 
-'''
-    TO:do
-    SET PUBLISHER AND IMAGES TO ONLY UPDATE THE VALUES FOR IMAGE_ARRAY AND JOINT_ARRAY. WE ONLY WANT ONE INSTANCE OF STREAM HANDLING THE SENDING OTHERWISE
-    THEY CAN OVERLAP AND CRASH (CURRRENTLY HAPPENING)
-
-'''
 
 
 class Joy_Sub(Node):
@@ -65,19 +63,22 @@ class Joy_Sub(Node):
 
     def __init__(self, executor, publisher, subscriber, wrist_image_subscriber, stream):
         super().__init__('controller_listener')
+
+        # Executor and nodes for teleop control and smolVLA policy. Allows us to activate teleop mode or policy mode.
         self.executor=executor
         self.subscriber=subscriber
         self.wrist_image_subscriber=wrist_image_subscriber
         self.stream=stream
         self.publisher=publisher
+        self.target=np.array([0.0,-0.25,0.15]) #initialising the target joint positions for teleop control
         
         
-        self.teleop_state=True #flag for teleoperation state
+        self.teleop_state=False #flag for teleoperation state
         self.time_at_flip=self.get_clock().now() # time when teleop state changes
 
         self.current_joints=self.create_subscription(JointState,'joint_states',self.joints_callback,20) #listening for current joint positions (feedback control later?)
         self.sub=self.create_subscription(Joy,'joy', self.joy_callback, 10)
-        self.pub=self.create_publisher(JointState,'joint_command',10)
+        #self.pub=self.create_publisher(JointState,'joint_command',10)
         
         self.controller = Joy()
         self.teleop_control = JointState()
@@ -91,7 +92,6 @@ class Joy_Sub(Node):
     def joints_callback(self,msg):  
         #   nothing for now
         return
-
 
     '''Change to IK'''
 
@@ -114,22 +114,36 @@ class Joy_Sub(Node):
         dt = (current_time - self.last_time).nanoseconds * 1e-9
         self.last_time = current_time
 
-
+        '''
         #---fetching controller input----#
-        input=np.array([self.controller.axes[0],self.controller.axes[1],-self.controller.axes[4],self.controller.axes[2]-self.controller.axes[5],self.controller.buttons[4]-self.controller.buttons[5],self.controller.buttons[1]-self.controller.buttons[2]])
+                input=np.array([self.controller.axes[0],self.controller.axes[1],-self.controller.axes[4],self.controller.axes[2]-self.controller.axes[5],self.controller.buttons[4]-self.controller.buttons[5],self.controller.buttons[1]-self.controller.buttons[2]])
+                
+                #----Incrementing the target pos in the desired direction ---#
+                self.target_pos+= input* self.max_speed * dt #radians/s
         
-        #----Incrementing the target pos in the desired direction ---#
-        self.target_pos+= input* self.max_speed * dt #radians/s
-
-        #--- Enforcing joint limits ----#
-        for i, radians in enumerate(self.target_pos):
-            self.target_pos[i]=np.clip(self.target_pos[i],lower_lim[i],upper_lim[i])
-            #print(self.target_pos)
-
-        #---Setting the joint command to the calculated pos ---#
-        self.teleop_control.position = self.target_pos.tolist()
+                #--- Enforcing joint limits ----#
+                for i, radians in enumerate(self.target_pos):
+                    self.target_pos[i]=np.clip(self.target_pos[i],lower_lim[i],upper_lim[i])
+                    #print(self.target_pos)
         
+                #---Setting the joint command to the calculated pos ---#
+                self.teleop_control.position = self.target_pos.tolist()
+
         return self.pub.publish(self.teleop_control) #publish the joint commands
+        '''
+        x = self.controller.axes[0]  # left stick horizontal
+        y = self.controller.axes[1]  # left stick vertical
+        z = -self.controller.axes[4]  # right stick vertical (inverted)
+       
+        input = np.array([x, y, z])  # target position
+        self.target += input * self.max_speed * dt  # incrementing the target pos in the desired direction
+        self.stream.IK_input = self.target # setting the IK input to the target position
+        #print(f"Target position: {self.target}, IK input: {self.stream.IK_input}")
+        
+        #self.teleop_control.position = joint_angles.tolist()  # setting the joint command to the calculated pos
+
+        
+        return #self.pub.publish(self.teleop_control) #publish the joint commands
 
   
     def joy_callback(self, msg):
@@ -173,15 +187,16 @@ class Joy_Sub(Node):
         #if xbox button pressed to start teleop, start formulating joint commands from the controller.
         if self.teleop_state is True:
             self.start_teleop_control()
-            self.executor.remove_node(self.subscriber)
-            self.executor.remove_node(self.wrist_image_subscriber)
-            self.executor.remove_node(self.stream)
-            self.executor.remove_node(self.publisher)
+            #self.executor.remove_node(self.subscriber)
+            #self.executor.remove_node(self.wrist_image_subscriber)
+            #self.executor.remove_node(self.stream)
+            #self.executor.remove_node(self.publisher)
+        # if xbox button pressed to stop teleop, start sending the joint states and images to smolVLA for inference.
         else:
-            self.executor.add_node(self.subscriber)
+            #self.executor.add_node(self.subscriber)
             self.executor.add_node(self.wrist_image_subscriber)
-            self.executor.add_node(self.stream)
-            self.executor.add_node(self.publisher)
+            #self.executor.add_node(self.stream)
+            #self.executor.add_node(self.publisher)
 
         return
 
@@ -223,8 +238,8 @@ class Publisher(Node):
         if self.pos is not None:
             #--- Enforcing joint limits ----#
             for i, radians in enumerate(self.pos):
-                if i ==2 or i==3:  #inverting the elbow and wrist flex joints to match the robot's joint direction
-                    self.pos[i] = self.pos[i] * -1
+                #if i ==2 or i==3:  #inverting the elbow and wrist flex joints to match the robot's joint direction
+                 #   self.pos[i] = self.pos[i] * -1
                 self.pos[i]=np.clip(self.pos[i],lower_lim[i],upper_lim[i])
 
             
@@ -271,31 +286,56 @@ class Streamer(Node):
         self.image_array=None
         self.prompt=None
 
+        self.IK_input=None
+
         self.prev_state_array=None
         self.prev_image_array=None
 
+        '''TCP socket for smolVLA'''
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1) # TCP_NODELAY sends small packets immediately. (Doesnt group TCP requests for efficiency)
         self.socket.connect(("127.0.0.1", 5301))
+     
+        '''TCP socket for IK solver'''
+        self.IKsocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.IKsocket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1) # TCP_NODELAY sends small packets immediately. (Doesnt group TCP requests for efficiency)
+        self.IKsocket.connect(("127.0.0.1", 8888))
+
+
         print(f"ROS2 TCP Streamer Initialised")
 
         self.create_timer(1.0 / hz, self.send_obs)  #ros2 timer to send the latest observation to smolVLA at a fixed frequency (hz)
+        print(f"ROS2 TCP Streamer Timer Initialised at {hz} Hz")
         #stream_main = threading.Thread(target=self.main, daemon=True)
         #stream_main.start()
     
         
     
     def send_obs(self):
+        #print(f"Sending obs")
         #print(f"state_array: {self.state_array} ")
         #if self.state_array != self.prev_state_array or self.image_array != self.prev_image_array:
+        #print(f"IK input - : {self.IK_input}")
+        if self.IK_input is not None:
+            send_msg(self.IKsocket, {"input": self.IK_input})  #sending the input to the IK solver over TCP
+            Ik_response = recv_msg(self.IKsocket)  #receiving the joint angles from the IK solver over TCP
+            joints=Ik_response.get("joint_angles")
+            #print(f"IK output - Received joint angles: {joints}")
+            if joints is not None:
+                self.publisher.pos = joints.tolist()  #publishing the joint angles to the robot over ROS2
+                #print(f"IK output - Publishing: {self.publisher.pos}")
+
+        ''' 
         send_msg(self.socket, {"state": self.state_array, "image": self.image_array, "task": self.prompt})
-        action = recv_msg(self.socket)
-        if action is not None:  #action is received from smolVLA and is a tensor of joint angles in degrees, which needs to be converted to radians for ROS2 publishing
-            tensor_to_degree_action = np.asarray(action, dtype=np.float64).reshape(-1).tolist()  #tensor to list for publishing
-            degree_to_radian_action = [np.deg2rad(x) for x in tensor_to_degree_action]  #converting to radians for ROS2 publishing
-            self.publisher.pos = degree_to_radian_action    #publishing to joint publisher node to send to isaac sim
-            print(f"Publishing: {self.publisher.pos}")
-    
+                action = recv_msg(self.socket)
+                if action is not None:  #action is received from smolVLA and is a tensor of joint angles in degrees, which needs to be converted to radians for ROS2 publishing
+                    tensor_to_degree_action = np.asarray(action, dtype=np.float64).reshape(-1).tolist()  #tensor to list for publishing
+                    degree_to_radian_action = [np.deg2rad(x) for x in tensor_to_degree_action]  #converting to radians for ROS2 publishing
+                    self.publisher.pos = degree_to_radian_action    #publishing to joint publisher node to send to isaac sim
+                    print(f"Publishing: {self.publisher.pos}")
+            
+        '''
+        
         return
 
     '''
@@ -344,9 +384,11 @@ def main(args=None):
     
     executor.add_node(teleop)
     executor.add_node(publisher)
-    
-    
+    executor.add_node(subscriber)
+    executor.add_node(wrist_image_subscriber)
+    executor.add_node(stream)
 
+    
     
     
         

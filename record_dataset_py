@@ -2,6 +2,15 @@ import numpy as np
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 
+
+'''
+Good source into lerobot datasets:
+https://docs.phospho.ai/learn/lerobot-dataset
+
+'''
+
+
+
 class RecordDataset():
     def __init__(self):
         self.joints = ["shoulder_pan", "shoulder_lift","elbow_flex","wrist_flex","wrist_roll","gripper"]    #joint names for the robot, used to name the state and action features in the dataset
