@@ -83,10 +83,17 @@ class Joy_Sub(Node):
         self.scene_image_subscriber=scene_image_subscriber
         self.stream=stream
         self.publisher=publisher
-        self.target=np.array([0.0,-0.25,0.15,0.0,-1.5708,0.0]) #initialising the target joint positions for teleop control
-        self.wrist_rot=-0.5
-        self.gripper=0.0
-        self.wrist_pitch=0.0
+        #self.target=np.array([0.0,-0.25,0.15,0.0,-1.5708,0.0,0.0]) #initialising the target joint positions for teleop control
+        #self.wrist_rot=0.0
+        #self.gripper=0.0
+
+        self.gripper = 0.0
+
+        # Maximum Cartesian speeds.
+        self.max_linear_speed = 0.05       # m/s
+        self.max_angular_speed = 0.25       # rad/s
+
+        self.stream.IK_input = None
         
         self.teleop_state=False #flag for teleoperation state
         self.time_at_flip=self.get_clock().now() # time when teleop state changes
@@ -98,7 +105,7 @@ class Joy_Sub(Node):
         self.controller = Joy()
         self.teleop_control = JointState()
         self.teleop_control.name = joint_names
-        self.target_pos=np.array([0.0,0.0,0.0,0.0,1.5708,0.0])
+        #self.target_pos=np.array([0.0,0.0,0.0,0.0,1.5708,0.0])
         self.max_speed=0.05
         self.last_time= self.get_clock().now()
 
@@ -120,6 +127,51 @@ class Joy_Sub(Node):
     '''
 
     def start_teleop_control(self):
+
+        # Read joystick inputs.
+        x = float(self.controller.axes[0])
+        y = float(-self.controller.axes[1])
+        z = float(-self.controller.axes[4])
+
+        # Rotation controls:
+        # Rx = pitch command, using LB/RB.
+        # Ry = wrist-roll command, using the triggers.
+        Rx = float(self.controller.buttons[4] - self.controller.buttons[5])
+        Ry = float(self.controller.axes[5] - self.controller.axes[2])
+
+        # Gripper remains a position command.
+        Gripper = float(
+            self.controller.buttons[1] - self.controller.buttons[2]
+        )
+
+        # Convert joystick values into Cartesian velocities.
+        vx = x * self.max_linear_speed
+        vy = y * self.max_linear_speed
+        vz = z * self.max_linear_speed
+
+        wx = Rx * self.max_angular_speed
+        wy = Ry * self.max_angular_speed
+
+        # Integrate gripper separately.
+        current_time = self.get_clock().now()
+        dt = (current_time - self.last_time).nanoseconds * 1e-9
+        self.last_time = current_time
+
+        dt = float(np.clip(dt, 0.001, 0.1))
+
+        self.gripper += Gripper * 0.5 * dt
+        self.gripper = float(
+            np.clip(self.gripper, lower_lim[5], upper_lim[5])
+        )
+
+        # Send Cartesian velocities, not Cartesian positions.
+        self.stream.IK_input = [
+            vx, vy, vz, wx, wy, self.gripper
+        ]
+
+        return
+
+    def old_start_teleop_control(self):
 
         '''
         Converting controller inputs to joint commands, and publishing them.
@@ -148,23 +200,23 @@ class Joy_Sub(Node):
         '''
         x = self.controller.axes[0]  # left stick horizontal
         y = -self.controller.axes[1]  # left stick vertical
-        z = self.controller.axes[4]  # right stick vertical (inverted)
+        z = -self.controller.axes[4]  # right stick vertical (inverted)
         
-        wrist_pitch = self.controller.buttons[4]-self.controller.buttons[5]
-        wrist_roll = self.controller.axes[5]-self.controller.axes[2]
-        
+        Rx =0.0 #self.controller.buttons[4]-self.controller.buttons[5]
+        Ry =0.0 #self.controller.axes[5]-self.controller.axes[2]
+        Rz = 0 #placeholder, gets overwritten
         Gripper= self.controller.buttons[1]-self.controller.buttons[2]
        
-        input = np.array([x, y, z, wrist_pitch, wrist_roll ,Gripper])  # target position + gripper
+        input = np.array([x, y, z, Rx, Ry, Rz, Gripper])  # target position + gripper
         self.target += input * self.max_speed * dt  # incrementing the target pos in the desired direction
-        self.wrist_pitch+=wrist_pitch * self.max_speed * dt
-        self.wrist_rot+=wrist_roll * self.max_speed * dt
+        self.wrist_rot+=Ry * self.max_speed * dt
         self.gripper+=Gripper * self.max_speed * dt
-        self.target[3] = np.clip(self.wrist_pitch*3, lower_lim[3],upper_lim[3])
         self.target[4] = np.clip(self.wrist_rot*3, lower_lim[4],upper_lim[4])
-        self.target[5] = np.clip(self.gripper*5, lower_lim[5],upper_lim[5])
-
+        self.target[5] = np.arctan2(self.target[1] -0.0452 , self.target[0]) + np.pi / 2  # setting the yaw
+        self.target[6] = np.clip(self.gripper*5, lower_lim[5],upper_lim[5])
+        #self.target[3:5] = 0.0
         #print(f"Target: {self.target}")
+        #self.target[0:5] = [0.0,0.0,0.0,0,0]
         self.stream.IK_input = self.target # setting the IK input to the target position
         #print(f"Target position: {self.target}, IK input: {self.stream.IK_input}")
         
@@ -207,9 +259,10 @@ class Joy_Sub(Node):
         self.time_now=self.get_clock().now() #getting current time
 
         #if the xbox button has been pressed to start/stop teleop
-        if ((self.time_now-self.time_at_flip).nanoseconds * 1e-9 > 0.3) and self.controller.buttons[8] is 1:    #small delay used to ignore multiple input presses due to high Hz
+        if ((self.time_now-self.time_at_flip).nanoseconds * 1e-9 > 0.3 and self.controller.buttons[8] == 1):    #small delay used to ignore multiple input presses due to high Hz
             self.teleop_state = not self.teleop_state
             self.time_at_flip = self.time_now
+            self.last_time = self.time_now
             print(f"Teleoperation : ", self.teleop_state)
             self.stream.teleop_state=self.teleop_state
             
@@ -318,7 +371,25 @@ class Subscriber(Node):
         self.subscription  
         self.joint_pos=None# prevent unused variable warning
 
+    
     def listener_callback(self, msg):
+
+        self.stream.joint_positions = dict(zip(msg.name, msg.position))
+
+        if not all(name in self.stream.joint_positions for name in joint_names):
+            print("Missing joints:", msg.name)
+            return
+
+        joint_pos_to_degree = [
+            np.rad2deg(self.stream.joint_positions[name])
+            for name in joint_names
+        ]
+
+        self.stream.state_array = joint_pos_to_degree
+
+        print("Joint feedback:", self.stream.joint_positions)
+
+    def old_listener_callback(self, msg):
         self.joint_pos=msg.position
         joint_pos_to_degree = [np.rad2deg(x) for x in self.joint_pos]  #converting to degrees for smolVLA
         self.stream.state_array=joint_pos_to_degree  #setting the updated joint pos to TCP streamers input
@@ -343,7 +414,7 @@ class Streamer(Node):
         self.top_image_array=None
         self.prompt=None
         self.teleop_state=None
-
+        self.joint_positions = None
         self.IK_input=None
 
         self.prev_state_array=None
@@ -375,16 +446,41 @@ class Streamer(Node):
         #if self.state_array != self.prev_state_array or self.image_array != self.prev_image_array:
         #print(f"IK input - : {self.IK_input}")
         
+        if self.teleop_state is True:
+
+            if (
+                self.IK_input is not None
+                and self.joint_positions is not None
+            ):
+
+                send_msg(self.IKsocket, {
+                    "input": self.IK_input,
+                    "joint_positions": self.joint_positions
+                })
+
+                Ik_response = recv_msg(self.IKsocket)
+
+                joints = Ik_response.get("joint_angles")
+                success = Ik_response.get("success")
+
+                if success and joints is not None:
+                    # Server returns a Python list, not a NumPy array.
+                    self.publisher.pos = list(joints)
+
+                    # Do not overwrite the previous command on failure.
+        '''
         if self.teleop_state == True:
             if self.IK_input is not None:
                 send_msg(self.IKsocket, {"input": self.IK_input})  #sending the input to the IK solver over TCP
                 Ik_response = recv_msg(self.IKsocket)  #receiving the joint angles from the IK solver over TCP
                 joints=Ik_response.get("joint_angles")
+                success=Ik_response.get("success")
+                print(f"Success: {success} Joint angles: {joints}")
                 #print(f"IK output - Received joint angles: {joints}")
                 if joints is not None:
                     self.publisher.pos = joints.tolist()  #publishing the joint angles to the robot over ROS2
                     #print(f"IK output - Publishing: {self.publisher.pos}")
-
+        '''
         '''Maybe do the same for a dataset TCP socket here?'''
 
         '''

@@ -1,435 +1,635 @@
-'''
-VLA_task.py
-Summary: Creates the ISAAC standalone environment, establishes environment and tasks. Ran via run_standalone.sh.
-Louis Robinson  07/11/2026
-'''
-
-import os
-
-from isaacsim import SimulationApp
-simulation_app = SimulationApp({"headless": False}) # set true for headless (reduced GPU consumption)
-
-
-# enabling the ros2 bridge extension for ros2_control.py
-from isaacsim.core.utils.extensions import enable_extension
-enable_extension("isaacsim.ros2.bridge")
-enable_extension("omni.graph.window.action")
-enable_extension("omni.graph.window.generic")
-enable_extension("isaacsim.robot_motion.motion_generation")
-#enable_extension("isaacsim.robot_motion.pink")
-simulation_app.update()
-
-#--- omni library -----
-import omni.usd # Imports the USD
-import omni.ui as ui
-from omni.kit.viewport.utility import get_active_viewport
-import omni.kit.viewport.utility as vp_utils
-
-
-#--- isaac sim library -----
-from isaacsim.core.api import World
-from isaacsim.core.api.tasks import BaseTask
-from isaacsim.core.api.objects import DynamicCuboid, VisualCuboid
-from isaacsim.core.prims import RigidPrim, SingleArticulation # Grabs existing prims and enables articulation
-from isaacsim.core.utils.types import ArticulationAction
-from isaacsim.sensors.camera import Camera
-from isaacsim.robot_motion.motion_generation import LulaKinematicsSolver
-from isaacsim.core.utils.numpy.rotations import euler_angles_to_quats
-
-#---- General python library ------
-import time, random, asyncio, datetime
-import numpy as np
-import matplotlib.pyplot as plt
-from pathlib import Path
-import socket
 import threading
+import subprocess
+import rclpy
+import numpy as np
+import socket
 from tcp_helper import send_msg, recv_msg
 
 
 
-#TCP_CUBE=None
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.qos import qos_profile_sensor_data
+from rclpy.node import Node
+from sensor_msgs.msg import JointState, Image, Joy
 
+
+
+
+#from smolvla import smolVLA
 
 '''
-TO DO:
-
-- I dont like smolvla_server and client, the TCP method seems over the top and inefficient.
-    Instead, looking into ROS2 bridge to create a pub/sub method for smolVLA control.
-    (Done) Ros2 install: https://docs.isaacsim.omniverse.nvidia.com/5.1.0/installation/install_ros.html 
-    Camera: https://docs.isaacsim.omniverse.nvidia.com/5.1.0/ros2_tutorials/tutorial_ros2_camera.html 
-    Joint States: https://docs.isaacsim.omniverse.nvidia.com/5.1.0/ros2_tutorials/tutorial_ros2_manipulation.html 
-    Stand-alone application (code) ros2 : https://docs.isaacsim.omniverse.nvidia.com/5.1.0/ros2_tutorials/tutorial_ros2_python.html 
-    ros2 validation: https://www.linkedin.com/posts/jialei-li-708970250_built-an-visionlanguageaction-pipeline-ugcPost-7411378852200878080-AnMq/ 
-
-
-SmolVLA implemented into isaac sim but goes to a default joint angle. 
-Create episodes to fine tune the model to pick up the cube.
-https://huggingface.co/lerobot/smolvla_base
+TO DO
+ARM is spasming when teleop is activated. Need to find out why. I think its because the IK fails and something happens when the requested pos it out of bounds
 '''
 
 
-#https://docs.isaacsim.omniverse.nvidia.com/5.1.0/core_api_tutorials/tutorial_core_adding_manipulator.html
+
+#---Setting joint limits----#
+upper_lim=[2,3.49,0,1.2,3.14159,2]
+lower_lim=[-2,0,-3.1415752,-2.5,-3.1415752,-0.199997279]
+joint_names = ["shoulder_pan", "shoulder_lift","elbow_flex","wrist_flex","wrist_roll","gripper"]
+
+
 
 
 '''
-Creating the Task environment
-- Tasks provide scene modularisation, scene creation, information, retrieval, and metric calculation.
-https://docs.isaacsim.omniverse.nvidia.com/5.1.0/core_api_tutorials/tutorial_core_adding_manipulator.html#what-is-a-task
+ROS2 Bridge to Connect Isaac sim S0-100 arm joint state to SmolVLA
+1. --Use start_ros2.py to load up isaac sim with the ros2 bridge--
+2. -- Run with : 
+    source /opt/ros/jazzy/setup.bash
+    /usr/bin/python3 /home/louis/nvidia/FinalYearProject/ros2_control.py
+
+
+References:
+ROS 2 install:  https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html
+                https://docs.isaacsim.omniverse.nvidia.com/5.1.0/installation/install_ros.html#install-ros-2
+                https://docs.isaacsim.omniverse.nvidia.com/5.1.0/installation/install_ros.html#using-terminal
+                https://docs.isaacsim.omniverse.nvidia.com/5.1.0/installation/install_ros.html#setting-up-workspaces
+
+Setting up the Action Graph for ROS2 pub, sub, and ticks: https://docs.isaacsim.omniverse.nvidia.com/5.1.0/ros2_tutorials/tutorial_ros2_manipulation.html#ros2-joint-control-extension-python-scripting
+
+Pub/Sub commands to interact with Isaac: https://docs.ros.org/en/jazzy/Tutorials/Beginner-Client-Libraries/Writing-A-Simple-Py-Publisher-And-Subscriber.html
+
+Ros2 Joy : https://index.ros.org/p/joy/
 '''
 
-'''Listening for SMolVLA input over TCP, and sending back the action output.'''
-class Streamer():
 
-    def __init__(self):
+
+'''
+Add top and scene camera to the joysub and the smolvla policy
+
+
+
+'''
+
+
+
+
+
+
+class Joy_Sub(Node):
+    '''
+    Listening for controller inputs and starting/stopping teleop control state
+    '''
+
+    def __init__(self, executor, publisher, subscriber, wrist_image_subscriber, scene_image_subscriber, top_image_subscriber, stream):
+        super().__init__('controller_listener')
+
+        # Executor and nodes for teleop control and smolVLA policy. Allows us to activate teleop mode or policy mode.
+        self.executor=executor
+        self.subscriber=subscriber
+        self.wrist_image_subscriber=wrist_image_subscriber
+        self.top_image_subscriber=top_image_subscriber
+        self.scene_image_subscriber=scene_image_subscriber
+        self.stream=stream
+        self.publisher=publisher
+        #self.target=np.array([0.0,-0.25,0.15,0.0,-1.5708,0.0,0.0]) #initialising the target joint positions for teleop control
+        #self.wrist_rot=0.0
+        #self.gripper=0.0
+
+        self.gripper = 0.0
+
+        # Maximum Cartesian speeds.
+        self.max_linear_speed = 0.05       # m/s
+        self.max_angular_speed = 0.25       # rad/s
+
+        self.stream.IK_input = None
         
-        bind_ip = "127.0.0.1" # binding our client to local host
-        port=8888
-        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)   # re-use address to allow quick rebind of a port
-        self.server.bind((bind_ip,port))
-        self.server.listen(5) # listening with a max backlog of 5
-        print(f"TCP listening on port {bind_ip} : {port}")
-        
-        self.joint_angles=None
-        self.output=None
-        #self.tcp_cube_pos = np.array([0.0, 0.0, 0.0])
-        #self.tcp_cube_rot = np.array([0.0, 0.0, 0.0])   # degrees
+        self.teleop_state=False #flag for teleoperation state
+        self.time_at_flip=self.get_clock().now() # time when teleop state changes
 
-        self.ik_solver = LulaKinematicsSolver(
-            robot_description_path="/home/louis/finalYear/SO-ARM100/Simulation/SO100/SO-100_LRDF.yaml",  # Path to the robot's URDF file
-            urdf_path="/home/louis/finalYear/SO-ARM100/Simulation/SO100/so100_tcp.urdf"
-        )
+        self.current_joints=self.create_subscription(JointState,'joint_states',self.joints_callback,20) #listening for current joint positions (feedback control later?)
+        self.sub=self.create_subscription(Joy,'joy', self.joy_callback, 10)
+        #self.pub=self.create_publisher(JointState,'joint_command',10)
         
+        self.controller = Joy()
+        self.teleop_control = JointState()
+        self.teleop_control.name = joint_names
+        #self.target_pos=np.array([0.0,0.0,0.0,0.0,1.5708,0.0])
+        self.max_speed=0.05
+        self.last_time= self.get_clock().now()
 
+        return
+
+    def joints_callback(self,msg):  
         
         return
 
-    def IK_solver(self, input):
-            '''
-            Using the isaac lab built in IK solver to convert the controller inputs to joint angles.
-            '''
-            
-            print(f"pos:{input[0:3]}")
-            print(f"rot: {input[3:6]}")
-            if self.output is None:
-                self.joint_angles,self.success = self.ik_solver.compute_inverse_kinematics(  #false if not reachable
-                    frame_name="tcp",
-                    target_position=input[0:3],  # [x, y, z] target position
-                    #target_orientation=euler_angles_to_quats(input[3:6]*np.pi/180), #[rx, ry, rz],
-                )
-            else:
-                self.joint_angles,self.success = self.ik_solver.compute_inverse_kinematics(  #false if not reachable
-                    frame_name="tcp",
-                    target_position=input[0:3],  # [x, y, z] target position
-                    #target_orientation=euler_angles_to_quats(input[3:6]),
-                    #warm_start=self.output[:len(self.ik_solver.get_joint_names())],
-                )
-                 
+    '''Change to IK'''
+
+    '''
+    - Take x,y,z,rx,ry,rz from the controller. 
+    - convert to joint space using IK (isaac lab has a built in IK solver).
+
     
-            print(f"IK solver success: {self.success}, joint angles: {self.joint_angles}")
+    Use isaac lab 
+    
+    '''
+
+    def start_teleop_control(self):
+
+        # Read joystick inputs.
+        x = float(self.controller.axes[0])
+        y = float(-self.controller.axes[1])
+        z = float(-self.controller.axes[4])
+
+        # Rotation controls:
+        # Rx = pitch command, using LB/RB.
+        # Ry = wrist-roll command, using the triggers.
+        Rx = float(self.controller.buttons[4] - self.controller.buttons[5])
+        Ry = float(self.controller.axes[5] - self.controller.axes[2])
+
+        # Gripper remains a position command.
+        Gripper = float(
+            self.controller.buttons[1] - self.controller.buttons[2]
+        )
+
+        # Convert joystick values into Cartesian velocities.
+        vx = x * self.max_linear_speed
+        vy = y * self.max_linear_speed
+        vz = z * self.max_linear_speed
+
+        wx = Rx * self.max_angular_speed
+        wy = Ry * self.max_angular_speed
+
+        # Integrate gripper separately.
+        current_time = self.get_clock().now()
+        dt = (current_time - self.last_time).nanoseconds * 1e-9
+        self.last_time = current_time
+
+        dt = float(np.clip(dt, 0.001, 0.1))
+
+        self.gripper += Gripper * 0.5 * dt
+        self.gripper = float(
+            np.clip(self.gripper, lower_lim[5], upper_lim[5])
+        )
+
+        # Send Cartesian velocities, not Cartesian positions.
+        self.stream.IK_input = [
+            vx, vy, vz, wx, wy, self.gripper
+        ]
+
+        return
+
+    def old_start_teleop_control(self):
+
+        '''
+        Converting controller inputs to joint commands, and publishing them.
+        '''
+        #--- fetching time for dt ---#
+        current_time = self.get_clock().now()
+        dt = (current_time - self.last_time).nanoseconds * 1e-9
+        self.last_time = current_time
+
+        '''
+        #---fetching controller input----#
+                input=np.array([self.controller.axes[0],self.controller.axes[1],-self.controller.axes[4],self.controller.axes[2]-self.controller.axes[5],self.controller.buttons[4]-self.controller.buttons[5],self.controller.buttons[1]-self.controller.buttons[2]])
+                
+                #----Incrementing the target pos in the desired direction ---#
+                self.target_pos+= input* self.max_speed * dt #radians/s
+        
+                #--- Enforcing joint limits ----#
+                for i, radians in enumerate(self.target_pos):
+                    self.target_pos[i]=np.clip(self.target_pos[i],lower_lim[i],upper_lim[i])
+                    #print(self.target_pos)
+        
+                #---Setting the joint command to the calculated pos ---#
+                self.teleop_control.position = self.target_pos.tolist()
+
+        return self.pub.publish(self.teleop_control) #publish the joint commands
+        '''
+        x = self.controller.axes[0]  # left stick horizontal
+        y = -self.controller.axes[1]  # left stick vertical
+        z = -self.controller.axes[4]  # right stick vertical (inverted)
+        
+        Rx =0.0 #self.controller.buttons[4]-self.controller.buttons[5]
+        Ry =0.0 #self.controller.axes[5]-self.controller.axes[2]
+        Rz = 0 #placeholder, gets overwritten
+        Gripper= self.controller.buttons[1]-self.controller.buttons[2]
+       
+        input = np.array([x, y, z, Rx, Ry, Rz, Gripper])  # target position + gripper
+        self.target += input * self.max_speed * dt  # incrementing the target pos in the desired direction
+        self.wrist_rot+=Ry * self.max_speed * dt
+        self.gripper+=Gripper * self.max_speed * dt
+        self.target[4] = np.clip(self.wrist_rot*3, lower_lim[4],upper_lim[4])
+        self.target[5] = np.arctan2(self.target[1] -0.0452 , self.target[0]) + np.pi / 2  # setting the yaw
+        self.target[6] = np.clip(self.gripper*5, lower_lim[5],upper_lim[5])
+        #self.target[3:5] = 0.0
+        #print(f"Target: {self.target}")
+        #self.target[0:5] = [0.0,0.0,0.0,0,0]
+        self.stream.IK_input = self.target # setting the IK input to the target position
+        #print(f"Target position: {self.target}, IK input: {self.stream.IK_input}")
+        
+        #self.teleop_control.position = joint_angles.tolist()  # setting the joint command to the calculated pos
+
+        
+        return #self.pub.publish(self.teleop_control) #publish the joint commands
+
+  
+    def joy_callback(self, msg):
+        '''
+        Responsible for listening for controller inputs and starting teleop.
+        '''
+        #----Getting the controller inputs----#
+        self.controller.header = msg.header
+        self.controller.axes = [
+            msg.axes[0], #left stick angular (starts -0.0: left is 1 : right is -1)
+            msg.axes[1], #left stick linear (starts -0.0: up is 1 : down is -1)
+            msg.axes[2], #left trigger (starts 1.0: pressing goes to -1, positions hold value)
+            msg.axes[3], #right stick angular (starts -0.0: left is 1 : right is -1)
+            msg.axes[4], #right stick linear (starts -0.0: up is 1 : down is -1)
+            msg.axes[5], #right trigger (starts 1.0: pressing goes to -1, positions hold value)
+            msg.axes[6], #Dpad angular (starts:0, left = -1, right = 1)
+            msg.axes[7]] #Dpad linear (starts:0, down = -1, up = 1)
+        self.controller.buttons = [
+            msg.buttons[0], #a
+            msg.buttons[1], #b
+            msg.buttons[2], #x
+            msg.buttons[3], #y
+            msg.buttons[4], #lb
+            msg.buttons[5], #rb
+            msg.buttons[6], #tab out
+            msg.buttons[7], #menu
+            msg.buttons[8], #xbox
+            msg.buttons[9], #Left stick
+            msg.buttons[10], #right stick
+            msg.buttons[11]] #middle button thing?
+
+        #---teleop-control---#
+        self.time_now=self.get_clock().now() #getting current time
+
+        #if the xbox button has been pressed to start/stop teleop
+        if ((self.time_now-self.time_at_flip).nanoseconds * 1e-9 > 0.3 and self.controller.buttons[8] == 1):    #small delay used to ignore multiple input presses due to high Hz
+            self.teleop_state = not self.teleop_state
+            self.time_at_flip = self.time_now
+            self.last_time = self.time_now
+            print(f"Teleoperation : ", self.teleop_state)
+            self.stream.teleop_state=self.teleop_state
+            
+        #if xbox button pressed to start teleop, start formulating joint commands from the controller.
+        if self.teleop_state is True:
+            self.start_teleop_control()
+           
+        return
+
+
+class Wrist_Camera_Subscriber(Node):
+    def __init__(self,stream):
+        super().__init__('wrist_camera_listener')
+        self.stream=stream      #sharing the stream class instance
+        self.latest_frame = None
+        self.create_subscription(
+            Image,  #image instead of jointstate
+            'wrist_camera',                         
+            self.image_callback,
+            qos_profile_sensor_data)    # best-effort, small queue. Publisher still sends frames if it doesnt get acknowledgement. (leaky downstream)
+
+    def image_callback(self, msg: Image):
+        self.latest_frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(
+            msg.height, msg.width, 3).copy()
+        
+        self.stream.wrist_image_array=self.latest_frame   #setting the latest frame to send over TCP
+        #print("Received Image")
+
+class Scene_Camera_Subscriber(Node):
+    def __init__(self,stream):
+        super().__init__('scene_camera_listener')
+        self.stream=stream      #sharing the stream class instance
+        self.latest_frame = None
+        self.create_subscription(
+            Image,  #image instead of jointstate
+            'scene_camera',                         
+            self.image_callback,
+            qos_profile_sensor_data)    # best-effort, small queue. Publisher still sends frames if it doesnt get acknowledgement. (leaky downstream)
+
+    def image_callback(self, msg: Image):
+        self.latest_frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(
+            msg.height, msg.width, 3).copy()
+        
+        self.stream.scene_image_array=self.latest_frame   #setting the latest frame to send over TCP
+        #print("Received Image")
+
+class Top_Camera_Subscriber(Node):
+    def __init__(self,stream):
+        super().__init__('top_camera_listener')
+        self.stream=stream      #sharing the stream class instance
+        self.latest_frame = None
+        self.create_subscription(
+            Image,  #image instead of jointstate
+            'top_camera',                         
+            self.image_callback,
+            qos_profile_sensor_data)    # best-effort, small queue. Publisher still sends frames if it doesnt get acknowledgement. (leaky downstream)
+
+    def image_callback(self, msg: Image):
+        self.latest_frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(
+            msg.height, msg.width, 3).copy()
+        
+        self.stream.top_image_array=self.latest_frame   #setting the latest frame to send over TCP
+        #print("Received Image")
+
+
+class Publisher(Node):
+    def __init__(self, hz=30):
+        super().__init__('joint_publisher')
+        self.pub = self.create_publisher(JointState,'joint_command',10)
+        self.pos = None
+        #timer_period=0.5 #seconds
+        #self.timer= self.create_timer(timer_period, self.timer_callback)
+        
+        self.create_timer(1.0 / hz, self.publish_action)
+        return
+
+
+    def publish_action(self):
+        msg=JointState()
+        msg.name = joint_names
+        if self.pos is not None:
+            #--- Enforcing joint limits ----#
+            for i, radians in enumerate(self.pos):
+                #if i ==2 or i==3:  #inverting the elbow and wrist flex joints to match the robot's joint direction
+                 #   self.pos[i] = self.pos[i] * -1
+                self.pos[i]=np.clip(self.pos[i],lower_lim[i],upper_lim[i])
+
+            
+            msg.position = self.pos # in radians
+            self.pub.publish(msg)
+            #print(f"Publishing: {msg.position}")
+        return
+
+
+class Subscriber(Node):
+
+    def __init__(self,stream):
+        super().__init__('joint_subscriber')
+        self.stream=stream
+        self.subscription = self.create_subscription(
+            JointState,
+            'joint_states',
+            self.listener_callback,
+            10)
+        
+        self.subscription  
+        self.joint_pos=None# prevent unused variable warning
+
+    
+    def listener_callback(self, msg):
+
+        self.stream.joint_positions = dict(zip(msg.name, msg.position))
+
+        if not all(name in self.stream.joint_positions for name in joint_names):
+            print("Missing joints:", msg.name)
             return
 
-    def handle_client(self, client_socket):
-        try:
-            while True:
-                self.tcp_data = recv_msg(client_socket)           # tcp_data = dict: x,y,z
-                print(f"Received TCP data: {self.tcp_data}")
-                input=self.tcp_data.get("input")
-              
-                if input is not None:  #if the input is not none and the joint output is reachable
-                    
-                    #self.tcp_cube_pos = np.array([input[0], input[1], input[2]])    # x, y, z
-                    #self.tcp_cube_rot = np.array([input[3], input[4], input[5]])    # Roll, pitch, yaw
-                    self.IK_solver(input[0:3])
-                    if self.success is True:
-                        self.output = np.array(self.joint_angles)   # lula returns a read-only array, but we want to modify the roll with our own roll.
-                        self.output[4:5]= input[4:5]    #over-writing the gripper and wrist rotation to manual control
-                        self.output=np.append(self.output,input[5])    # appending the gripper for the ROS2 pub
-                        print(f"output: {self.output}")
-                    else:
-                        print(f"Target position {input} is not reachable. Sending previous joint angles.")
-                send_msg(client_socket, {"joint_angles": self.output})    #always return response so it does hang
-        except ConnectionError:
-            print("Client disconnected")
-        finally:
-            client_socket.close()
+        joint_pos_to_degree = [
+            np.rad2deg(self.stream.joint_positions[name])
+            for name in joint_names
+        ]
+
+        self.stream.state_array = joint_pos_to_degree
+
+        print("Joint feedback:", self.stream.joint_positions)
+
+    def old_listener_callback(self, msg):
+        self.joint_pos=msg.position
+        joint_pos_to_degree = [np.rad2deg(x) for x in self.joint_pos]  #converting to degrees for smolVLA
+        self.stream.state_array=joint_pos_to_degree  #setting the updated joint pos to TCP streamers input
+        #self.get_logger().info('I heard: "%s"' % msg.position)
         return
 
+
+'''
+Streams the ROS2 outputs (image,joint states, and task) across TCP for SmolVLA to listen on
+
+Ros2 and lerobot are incompatible and therefore must be ran under different environements, hence
+the need for TCP.
+'''
+class Streamer(Node):
+    def __init__(self,publisher, hz=30, ):
+
+        super().__init__('ROS_TCP')
+        self.publisher=publisher
+        self.state_array=None
+        self.wrist_image_array=None
+        self.scene_image_array=None
+        self.top_image_array=None
+        self.prompt=None
+        self.teleop_state=None
+        self.joint_positions = None
+        self.IK_input=None
+
+        self.prev_state_array=None
+        self.prev_image_array=None
+
+        '''TCP socket for smolVLA'''
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1) # TCP_NODELAY sends small packets immediately. (Doesnt group TCP requests for efficiency)
+        self.socket.connect(("127.0.0.1", 5301))
+     
+        '''TCP socket for IK solver'''
+        self.IKsocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.IKsocket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1) # TCP_NODELAY sends small packets immediately. (Doesnt group TCP requests for efficiency)
+        self.IKsocket.connect(("127.0.0.1", 8888))
+
+
+        print(f"ROS2 TCP Streamer Initialised")
+
+        self.create_timer(1.0 / hz, self.send_obs)  #ros2 timer to send the latest observation to smolVLA at a fixed frequency (hz)
+        print(f"ROS2 TCP Streamer Timer Initialised at {hz} Hz")
+        #stream_main = threading.Thread(target=self.main, daemon=True)
+        #stream_main.start()
     
-    def main(self):
-        while True:
-            client,addr = self.server.accept()
-            print(f"Accepted connection from: {addr[0]}:{addr[1]}")
-            client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            client_handler=threading.Thread(target=self.handle_client, args=(client,))
-            client_handler.start()
-        return
-
-
-
-class Task(BaseTask):
-    def __init__(self,name):
-        super().__init__(name=name, offset=None)
-        #self.starting_pos = [0.0,0.0,0.0,0.0,-90.0,0.0]
-        self.goal_position = np.array([-0.3, -0.3, 0.0515/ 2.0])
-        self.task_achieved = False
-        #self.tcp_cube = None
-        return
-
-#creating our random cube    
-    def generate_cube(self, scene):
-        #randomising characteristics
-        rand_size=random.uniform(0.02,0.04)
-        rand_size=0.04
-        rand_pos=[random.uniform(-0.2,0.2),random.uniform(-0.2,0.2),0.1]
         
-        rand_Rcolour=random.uniform(0,1)
-        rand_Gcolour=random.uniform(0,1)
-        rand_Bcolour=random.uniform(0,1)
-        print(rand_size)
-        print(rand_pos)
-
-        #adding the cube to the scene
-        return scene.add(
-            DynamicCuboid(
-                prim_path="/World/random_cube",
-                name="random_cube",
-                position=np.array(rand_pos),
-                scale=np.array([rand_size, rand_size, rand_size]),
-                color=np.array([rand_Rcolour, rand_Gcolour, rand_Bcolour]),
-            )
-        )
+    
+    def send_obs(self):
+        #print(f"Sending obs")
+        #print(f"state_array: {self.state_array} ")
+        #if self.state_array != self.prev_state_array or self.image_array != self.prev_image_array:
+        #print(f"IK input - : {self.IK_input}")
         
-    #setting up the tasks scene
-    def set_up_scene(self, scene):
-        super().set_up_scene(scene)
+        if self.teleop_state is True:
 
-        ''' Guidance cube for teleoperating the arm
+            if (
+                self.IK_input is not None
+                and self.joint_positions is not None
+            ):
+
+                send_msg(self.IKsocket, {
+                    "input": self.IK_input,
+                    "joint_positions": self.joint_positions
+                })
+
+                Ik_response = recv_msg(self.IKsocket)
+
+                joints = Ik_response.get("joint_angles")
+                success = Ik_response.get("success")
+
+                if success and joints is not None:
+                    # Server returns a Python list, not a NumPy array.
+                    self.publisher.pos = list(joints)
+
+                    # Do not overwrite the previous command on failure.
+        '''
+        if self.teleop_state == True:
+            if self.IK_input is not None:
+                send_msg(self.IKsocket, {"input": self.IK_input})  #sending the input to the IK solver over TCP
+                Ik_response = recv_msg(self.IKsocket)  #receiving the joint angles from the IK solver over TCP
+                joints=Ik_response.get("joint_angles")
+                success=Ik_response.get("success")
+                print(f"Success: {success} Joint angles: {joints}")
+                #print(f"IK output - Received joint angles: {joints}")
+                if joints is not None:
+                    self.publisher.pos = joints.tolist()  #publishing the joint angles to the robot over ROS2
+                    #print(f"IK output - Publishing: {self.publisher.pos}")
+        '''
+        '''Maybe do the same for a dataset TCP socket here?'''
+
+        '''
         
-        self.tcp_cube=scene.add(
-        VisualCuboid(
-                prim_path="/World/TCP_marker",
-                name="TCP_marker",
-                position=np.array([-0.1, -0.1, 1]),
-                scale=np.array([0.01, 0.01, 0.01]),
-                color=np.array([0.3, 0.6, 0.1]),
-            )
-        )
+        if dataset record is true, send msg to dataset socket?
         
         '''
         
-
-        self.cube = self.generate_cube(scene)
-        self.fancy_cube = scene.add(RigidPrim(prim_paths_expr="/World/cube/Cube", name="Cube"))  #  cube's path (the one with the rigidbody api enabled)
-        self.arm = scene.add(SingleArticulation(prim_path="/so_arm100/base", name="so_arm100"))  # must be articulation root of arm
-
-        print(f"{self.arm} DoF: {self.arm.dof_names} Indicies:")
-        return
-
-    #Task metadata for monitoring progress
-    '''
-    Replaced with ROS2 bridge
-    '''
-    def get_observations(self): 
-        cube_pos, cube_orientation = self.cube.get_world_pose()
-        joint_pos = self.arm.get_joint_positions()
-        joint_vel= self.arm.get_joint_velocities()
-
-        #observations dict
-        observations = {
-             self.arm.name:{
-                  "joint_positions": joint_pos,
-                  "joint_velocities": joint_vel,
-             },
-             self.cube.name:{
-                  "position": cube_pos,
-                  "orientation": cube_orientation,
-             }
-        }
-        return observations
-    #--------------------
-
-
-    #called before each physics step
-    def pre_step(self, control_index, simulation_time):
-        #observation = self.get_observations()
-       # if not self.task_achieved and np.mean(np.abs(self.goal_position - observation[self.cube.name]["position"])) < 0.02:
-        #    self.task_achieved=True
-        return
-
-    #called after each reset
-    def post_reset(self):
-        #action = ArticulationAction(joint_positions=np.array(self.starting_pos)) #actions must be pre-defined
-        #self.arm.apply_action(action) #actions can then be commited
-        self.task_achieved=False
-        return
-
-
-'''
-Establishing our constant environment, adding the tasks
-'''
-class VLAEnvironment():
-    def __init__(self):
         
-        self.world = World()
-        self.task = Task(name="first_task")
-        self.world.add_task(self.task)
-        self.world.reset() # clean starting point
+        '''Send state to'''
+        
+        if self.teleop_state == False:
+            send_msg(self.socket, {"state": self.state_array, "wrist_image": self.wrist_image_array,"scene_image": self.scene_image_array, "top_image": self.top_image_array, "task": self.prompt})       
+            action = recv_msg(self.socket)
+            if action is not None:  #action is received from smolVLA and is a tensor of joint angles in degrees, which needs to be converted to radians for ROS2 publishing
+                tensor_to_degree_action = np.asarray(action, dtype=np.float64).reshape(-1).tolist()  #tensor to list for publishing
+                degree_to_radian_action = [np.deg2rad(x) for x in tensor_to_degree_action]  #converting to radians for ROS2 publishing
+                radian_output=degree_to_radian_action
+                radian_output[2]=radian_output[2]*-1  #inverting the elbow and wrist flex joints to match the robot's joint direction
+                radian_output[3]=radian_output[3]*-1
+                self.publisher.pos = radian_output    #publishing to joint publisher node to send to isaac sim
+                #print(f"Publishing: {self.publisher.pos}")
 
-        self.arm = self.world.scene.get_object("so_arm100")
-        self.arm.initialize() # initialises the controller
 
-        #self.world.add_physics_callback("sim_step", callback_fn=self.physics_step)
+        ''' Just a backup of original form of the above: 
+
+        send_msg(self.socket, {"state": self.state_array, "wrist_image": self.wrist_image_array,"scene_image": self.scene_image_array, "top": self.top_image_array, "task": self.prompt})
+                action = recv_msg(self.socket)
+                if action is not None:  #action is received from smolVLA and is a tensor of joint angles in degrees, which needs to be converted to radians for ROS2 publishing
+                    tensor_to_degree_action = np.asarray(action, dtype=np.float64).reshape(-1).tolist()  #tensor to list for publishing
+                    degree_to_radian_action = [np.deg2rad(x) for x in tensor_to_degree_action]  #converting to radians for ROS2 publishing
+                    self.publisher.pos = degree_to_radian_action    #publishing to joint publisher node to send to isaac sim
+                    print(f"Publishing: {self.publisher.pos}")
+            
+        '''
+        
         return
 
-
-   
     '''
-    Articulation controller inputs: https://docs.isaacsim.omniverse.nvidia.com/5.1.0/robot_simulation/articulation_controller.html#input-parameters 
-    '''
-   
-
-
-    def establish_viewports(self):
-        self.viewport1 = get_active_viewport()
-        self.viewport1.camera_path = "/so_arm100/gripper/Top"
-
-        self.window2 = vp_utils.create_viewport_window(name="Scene View")
-        self.window2.viewport_api.camera_path = "/so_arm100/scene"
-
-        # Get proper WindowHandle objects by title, for both windows
-        self.main_handle = ui.Workspace.get_window("Viewport")
-        self.scene_handle = ui.Workspace.get_window("Scene View")
-
-
-        #---adding our cameras for smolVLA---
-        self.camera_wrist = Camera(
-            prim_path="/so_arm100/gripper/wrist",
-            frequency=30,
-            resolution=(256,256)    #ensure the same value is allocated to ros2 Isaac Create Render Product Node!
-        )
-        self.camera_scene = Camera(
-            prim_path="/so_arm100/scene",
-            frequency=30,
-            resolution=(256,256)
-        )
-        self.camera_top = Camera(
-                    prim_path="/so_arm100/gripper/top",
-                    frequency=30,
-                    resolution=(256,256)    #ensure the same value is allocated to ros2 Isaac Create Render Product Node!
-                )
-
-        # --- initialising both cameras -----
-        self.world.reset() #reset world before initialising cameras
-        self.camera_scene.initialize()
-        self.camera_wrist.initialize()
-        self.camera_top.initialize()
-        self.camera_wrist.add_motion_vectors_to_frame()
-        self.camera_scene.add_motion_vectors_to_frame()
-        self.camera_top.add_motion_vectors_to_frame()
+    def main(self):
+        try:
+            print("main")
+            send_obs_timer=threading.Timer(2.0,self.send_obs)
+            send_obs_timer.start()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            send_obs_timer.cancel()
         return
+    '''
+    
+                
 
-    def enter_starting_pos(self, pos):
-                action = ArticulationAction(joint_positions=np.array(pos)) #actions must be pre-defined
-                self.arm.apply_action(action) #actions can then be commited
-                return
-'''
-    def create_action(self, pos):
-            action = ArticulationAction(joint_positions=np.array(pos), joint_indices=np.array([3])) #actions must be pre-defined
-            self.arm.apply_action(action) #actions can then be commited
-            return '''
+def main(args=None):
 
+
+    task_prompt = "Pick up the red cube"
+
+    #running the ros2 joy_node to start the controller publisher
+    joy_node = subprocess.Popen(['ros2','run','joy', 'joy_node'])
+
+    rclpy.init(args=args)
+    executor = MultiThreadedExecutor()
 
     
+    publisher = Publisher()
 
-    
-#---- Debug_func: Captures cameras view ----#
-def capture_scene(image):
+    '''VLA relevant nodes'''
+    stream = Streamer(publisher)  #initialising the TCP streamer with the publisher to send joint commands to
+    stream.prompt=task_prompt   #setting the TCP streams task prompt
+    subscriber = Subscriber(stream)
+    wrist_image_subscriber = Wrist_Camera_Subscriber(stream)
+    scene_image_subscriber = Scene_Camera_Subscriber(stream)
+    top_image_subscriber = Top_Camera_Subscriber(stream)
 
-    if image is None:
-        image=simulation.camera_wrist.get_rgba()
+    '''teleop control node for the robot'''
+    teleop = Joy_Sub(executor,publisher,subscriber,wrist_image_subscriber,scene_image_subscriber,top_image_subscriber,stream)  #initialising the teleop control node
 
-    date_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    image_path = Path(f"/home/louis/nvidia/FinalYearProject/capture_scene_output/image_{date_time}.png")
-
-    plt.imsave(f"/home/louis/nvidia/FinalYearProject/capture_scene_output/image_{date_time}.png", simulation.camera_wrist.get_rgba()[:, :, :3])
-    if image_path.exists():
-        print(f"Camera snapshot taken: {image_path}")
-    else:
-        print(f"Camera snapshot failed")
-    return
-
-'''
-def debug_output():
-    kps, kds = simulation.arm.get_articulation_controller().get_gains()
-    print("kp:", kps, "kd:", kds)
-    print("q:     ", np.round(simulation.arm.get_joint_positions(), 2))
-    print("target:", np.round(target, 2))
+    # Adding nodes 
+    executor.add_node(teleop)
+    executor.add_node(publisher)
+    executor.add_node(subscriber)
+    executor.add_node(wrist_image_subscriber)
+    executor.add_node(scene_image_subscriber)
+    executor.add_node(top_image_subscriber)
+    executor.add_node(stream)
 
 
-    return
-'''
+        
+
+    try:
+        executor.spin()
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        #stream.stop() # Cleaning up the TCP streamer
+        joy_node.terminate() # Cleaning up the joy_node process
+        subscriber.destroy_node()
+        #VLA.destroy_node()
+        publisher.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
-# ------- Main program ---------
-
-# Open the saved environment instead of building one from scratch
-omni.usd.get_context().open_stage("/home/louis/finalYear/SO-100_TCP.usd")
-
-#from smolvla_client import SmolVLARunner   # you can also move this to the top with your other imports
-
-simulation = VLAEnvironment()
-simulation.establish_viewports()
-streamer = Streamer()
-
-#streamer.tcp_cube=simulation.task.tcp_cube
+if __name__ == '__main__':
+    main()
 
 
-streamer_thread = threading.Thread(target=streamer.main)
-streamer_thread.start()
 
 
-#runner = SmolVLARunner(instruction="pick up the red cube",lower=simulation.arm.dof_properties["lower"],upper=simulation.arm.dof_properties["upper"])   # once only
-policy_step = 2      # physics 60 Hz -> policy ~30 Hz. 
 
-print(simulation.arm.dof_names)
-print(simulation.arm.dof_properties["lower"], simulation.arm.dof_properties["upper"])
 
-## Must run on the main thread
-while simulation_app.is_running():
-        simulation.world.step(render=True)
-        #streamer.tcp_cube.set_world_pose(position=streamer.tcp_cube_pos, orientation=euler_angles_to_quats(streamer.tcp_cube_rot))
-        if simulation.task.task_achieved:
-                print("Task Achieved")
-                simulation.world.reset()   # triggers Task.post_reset
-                #runner.reset()
-
-simulation_app.close()
+# How many keys
+# All paper work
+# Next service
+# Corrosion
+# Video
+# 
+#
+#
 
 
 '''
+Original script:
 
-i = 0
-while simulation_app.is_running():
+rclpy.init()    #initialises the ROS2 client library
+node = rclpy.create_node('smolVLA_controller') #Creates a node for smolVLA
+pub = node.create_publisher(JointState, 'joint_command', 10) #creates a publisher for the topic "joint_command". 10 is queue depth.
+sub = node.create_subscriber(JointState, 'joint_states', 10)
 
-    #rendering the sim environment
-    simulation.world.step(render=True)
+# Spin in a separate thread
+thread = threading.Thread(target=rclpy.spin, args=(node, ), daemon=True) #loop service for nodes internal timers, callback, clock, etc. Seperate thread or it blocks.
+thread.start()
 
-    #fetching the cameras buffer (directly taken from the world render)
-    wrist_frame = simulation.camera_wrist.get_current_frame()
-    scene_frame = simulation.camera_scene.get_current_frame()
+joint_state_position = JointState() #Holds both name and position.
 
-    #Ensuring world render is complete and added to camera buffers before feeding to smolVLA
-    if i >= 30 and wrist_frame["rgb"] is not None and scene_frame["rgb"] is not None:
+#defining the joints name and position
+joint_state_position.name = ["shoulder_pan", "shoulder_lift","elbow_flex","wrist_flex","wrist_roll","gripper"]
+joint_state_position.position = [0.0,0.0,0.3,-1.3,0.3,1.0] # in radians
 
-        if i == 30:
-            capture_scene()
-            #print(simulation.camera_wrist.get_current_frame()["motion_vectors"])
+rate = node.create_rate(10) #sends 10 times per sec
+try:
+    while rclpy.ok():
+        pub.publish(joint_state_position)   #publishing the joints
 
-    if simulation.task.task_achieved:
-        print("Task Achieved")
-
-    i +=1
-
-simulation_app.close()
+        rate.sleep() # sends and sleeps, waiting for the spin thread to reactivate
+except KeyboardInterrupt:
+    pass
+rclpy.shutdown()
+thread.join()
 '''
