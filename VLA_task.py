@@ -1,13 +1,13 @@
-
+'''
+VLA_task.py
+Summary: Creates the ISAAC standalone environment, establishes environment and tasks. Ran via run_standalone.sh.
+Louis Robinson  07/11/2026
+'''
 
 import os
 
 from isaacsim import SimulationApp
 simulation_app = SimulationApp({"headless": False}) # set true for headless (reduced GPU consumption)
-
-
-
-
 
 
 # enabling the ros2 bridge extension for ros2_control.py
@@ -16,6 +16,7 @@ enable_extension("isaacsim.ros2.bridge")
 enable_extension("omni.graph.window.action")
 enable_extension("omni.graph.window.generic")
 enable_extension("isaacsim.robot_motion.motion_generation")
+#enable_extension("isaacsim.robot_motion.pink")
 simulation_app.update()
 
 #--- omni library -----
@@ -23,6 +24,7 @@ import omni.usd # Imports the USD
 import omni.ui as ui
 from omni.kit.viewport.utility import get_active_viewport
 import omni.kit.viewport.utility as vp_utils
+
 
 #--- isaac sim library -----
 from isaacsim.core.api import World
@@ -32,6 +34,7 @@ from isaacsim.core.prims import RigidPrim, SingleArticulation # Grabs existing p
 from isaacsim.core.utils.types import ArticulationAction
 from isaacsim.sensors.camera import Camera
 from isaacsim.robot_motion.motion_generation import LulaKinematicsSolver
+from isaacsim.core.utils.numpy.rotations import euler_angles_to_quats
 
 #---- General python library ------
 import time, random, asyncio, datetime
@@ -44,8 +47,7 @@ from tcp_helper import send_msg, recv_msg
 
 
 
-
-TCP_CUBE=None
+#TCP_CUBE=None
 
 
 '''
@@ -90,25 +92,39 @@ class Streamer():
         
         self.joint_angles=None
         self.output=None
-        self.tcp_cube_pos=None
+        #self.tcp_cube_pos = np.array([0.0, 0.0, 0.0])
+        #self.tcp_cube_rot = np.array([0.0, 0.0, 0.0])   # degrees
 
+        self.ik_solver = LulaKinematicsSolver(
+            robot_description_path="/home/louis/finalYear/SO-ARM100/Simulation/SO100/SO-100_LRDF.yaml",  # Path to the robot's URDF file
+            urdf_path="/home/louis/finalYear/SO-ARM100/Simulation/SO100/so100_tcp.urdf"
+        )
         
 
+        
         return
 
     def IK_solver(self, input):
             '''
             Using the isaac lab built in IK solver to convert the controller inputs to joint angles.
             '''
-            ik_solver = LulaKinematicsSolver(
-                robot_description_path="/home/louis/finalYear/SO-ARM100/Simulation/SO100/SO-100_LRDF.yaml",  # Path to the robot's URDF file
-                urdf_path="/home/louis/finalYear/SO-ARM100/Simulation/SO100/so100_tcp.urdf"
-            )
-            self.joint_angles,self.success = ik_solver.compute_inverse_kinematics(  #false if not reachable
-                frame_name="tcp",
-                target_position=input,  # [x, y, z] target position
-                target_orientation=None,#[rx, ry, rz],
-            )
+            
+            print(f"pos:{input[0:3]}")
+            print(f"rot: {input[3:6]}")
+            if self.output is None:
+                self.joint_angles,self.success = self.ik_solver.compute_inverse_kinematics(  #false if not reachable
+                    frame_name="tcp",
+                    target_position=input[0:3],  # [x, y, z] target position
+                    #target_orientation=euler_angles_to_quats(input[3:6]*np.pi/180), #[rx, ry, rz],
+                )
+            else:
+                self.joint_angles,self.success = self.ik_solver.compute_inverse_kinematics(  #false if not reachable
+                    frame_name="tcp",
+                    target_position=input[0:3],  # [x, y, z] target position
+                    #target_orientation=euler_angles_to_quats(input[3:6]),
+                    #warm_start=self.output[:len(self.ik_solver.get_joint_names())],
+                )
+                 
     
             print(f"IK solver success: {self.success}, joint angles: {self.joint_angles}")
             return
@@ -121,11 +137,15 @@ class Streamer():
                 input=self.tcp_data.get("input")
               
                 if input is not None:  #if the input is not none and the joint output is reachable
-                    #x, y, z = input[0], input[1], input[2]
-                    self.tcp_cube_pos = np.array([input[0], input[1], input[2]])
-                    self.IK_solver(input)
+                    
+                    #self.tcp_cube_pos = np.array([input[0], input[1], input[2]])    # x, y, z
+                    #self.tcp_cube_rot = np.array([input[3], input[4], input[5]])    # Roll, pitch, yaw
+                    self.IK_solver(input[0:3])
                     if self.success is True:
-                        self.output = self.joint_angles
+                        self.output = np.array(self.joint_angles)   # lula returns a read-only array, but we want to modify the roll with our own roll.
+                        self.output[4:5]= input[4:5]    #over-writing the gripper and wrist rotation to manual control
+                        self.output=np.append(self.output,input[5])    # appending the gripper for the ROS2 pub
+                        print(f"output: {self.output}")
                     else:
                         print(f"Target position {input} is not reachable. Sending previous joint angles.")
                 send_msg(client_socket, {"joint_angles": self.output})    #always return response so it does hang
@@ -153,7 +173,7 @@ class Task(BaseTask):
         #self.starting_pos = [0.0,0.0,0.0,0.0,-90.0,0.0]
         self.goal_position = np.array([-0.3, -0.3, 0.0515/ 2.0])
         self.task_achieved = False
-        self.tcp_cube = None
+        #self.tcp_cube = None
         return
 
 #creating our random cube    
@@ -184,6 +204,8 @@ class Task(BaseTask):
     def set_up_scene(self, scene):
         super().set_up_scene(scene)
 
+        ''' Guidance cube for teleoperating the arm
+        
         self.tcp_cube=scene.add(
         VisualCuboid(
                 prim_path="/World/TCP_marker",
@@ -193,6 +215,9 @@ class Task(BaseTask):
                 color=np.array([0.3, 0.6, 0.1]),
             )
         )
+        
+        '''
+        
 
         self.cube = self.generate_cube(scene)
         self.fancy_cube = scene.add(RigidPrim(prim_paths_expr="/World/cube/Cube", name="Cube"))  #  cube's path (the one with the rigidbody api enabled)
@@ -279,7 +304,7 @@ class VLAEnvironment():
 
         #---adding our cameras for smolVLA---
         self.camera_wrist = Camera(
-            prim_path="/so_arm100/gripper/Top",
+            prim_path="/so_arm100/gripper/wrist",
             frequency=30,
             resolution=(256,256)    #ensure the same value is allocated to ros2 Isaac Create Render Product Node!
         )
@@ -288,13 +313,20 @@ class VLAEnvironment():
             frequency=30,
             resolution=(256,256)
         )
+        self.camera_top = Camera(
+                    prim_path="/so_arm100/gripper/top",
+                    frequency=30,
+                    resolution=(256,256)    #ensure the same value is allocated to ros2 Isaac Create Render Product Node!
+                )
 
         # --- initialising both cameras -----
         self.world.reset() #reset world before initialising cameras
         self.camera_scene.initialize()
         self.camera_wrist.initialize()
+        self.camera_top.initialize()
         self.camera_wrist.add_motion_vectors_to_frame()
         self.camera_scene.add_motion_vectors_to_frame()
+        self.camera_top.add_motion_vectors_to_frame()
         return
 
     def enter_starting_pos(self, pos):
@@ -350,7 +382,7 @@ simulation = VLAEnvironment()
 simulation.establish_viewports()
 streamer = Streamer()
 
-streamer.tcp_cube=simulation.task.tcp_cube
+#streamer.tcp_cube=simulation.task.tcp_cube
 
 
 streamer_thread = threading.Thread(target=streamer.main)
@@ -366,7 +398,7 @@ print(simulation.arm.dof_properties["lower"], simulation.arm.dof_properties["upp
 ## Must run on the main thread
 while simulation_app.is_running():
         simulation.world.step(render=True)
-        streamer.tcp_cube.set_world_pose(position=streamer.tcp_cube_pos)
+        #streamer.tcp_cube.set_world_pose(position=streamer.tcp_cube_pos, orientation=euler_angles_to_quats(streamer.tcp_cube_rot))
         if simulation.task.task_achieved:
                 print("Task Achieved")
                 simulation.world.reset()   # triggers Task.post_reset

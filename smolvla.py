@@ -45,13 +45,15 @@ class Streamer():
         try:
             while True:
                 obs = recv_msg(client_socket)           # obs = dict: images, state, task string
-                frame=obs.get("image")
+                wrist_camera=obs.get("wrist_image")
+                scene_camera=obs.get("scene_image")
+                top_camera=obs.get("top_image")
                 #print(f"Frame: {frame}")
                 joints=obs.get("state")
                 task=obs.get("task")
-                if frame is not None and joints is not None and task is not None:
-                    print(f"Sending frame size: {frame.shape}, joints: {joints}, task: {task} to smolVLA")
-                    self.smolvla.get_obs(frame,joints,task)
+                if wrist_camera is not None and scene_camera is not None and top_camera is not None and joints is not None and task is not None:
+                    print(f"Sending wrist_camera size: {wrist_camera.shape}, scene_camera size: {scene_camera.shape}, top_camera size: {top_camera.shape}, joints: {joints}, task: {task} to smolVLA")
+                    self.smolvla.get_obs(wrist_camera,scene_camera, top_camera, joints,task)
                     self.smolvla.get_action()
                     self.action=self.smolvla.action
                 send_msg(client_socket, self.action)
@@ -112,13 +114,13 @@ class smolVLA():
                     print("patched", type(step).__name__, attr)
         
     
-    def get_obs(self,frame,joints,task):
+    def get_obs(self,wrist_camera,scene_camera, top_camera,joints,task):
         #print("Received frame size:", frame.shape, "joints:", joints, "task:", task) # converting state to tensor for PyTorch model input
         state = torch.tensor(list(joints), dtype=torch.float32).unsqueeze(0)  # (1, 6)
         self.obs = {     # the observation dict smolVLA expects (Standardised naming convention)
-                #"observation.images.camera1": self.to_tensor(frame),    #top
-                "observation.images.camera2": self.to_tensor(frame),    #wrist
-                #"observation.images.camera3": self.to_tensor(frame),    #side
+                "observation.images.camera1": self.to_tensor(top_camera),    #top
+                "observation.images.camera2": self.to_tensor(wrist_camera),    #wrist
+                "observation.images.camera3": self.to_tensor(scene_camera),    #side
                 "observation.state": state,   # joint state in the policy's units
                 "task": task,               # required: SmolVLA is language-conditioned
             }
